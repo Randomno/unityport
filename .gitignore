@@ -1,0 +1,11 @@
+# Games, ported builds and logs used for testing
+/assets/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Native build output
+/native/build*/
