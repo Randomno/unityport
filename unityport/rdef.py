@@ -11,6 +11,8 @@ Where Unity keeps the reflection data depends on the version:
              pointing into the pass's m_NameIndices).
   2020:      shared parts in prog*.m_CommonParameters, the rest per variant
              in the blob entry after the program code (see parse_blob_params).
+  2021.2+:   as 2020, but the per-variant part is a separate blob entry
+             (see parse_params).
 Both are normalized into a Reflection before building RDEF.
 """
 
@@ -30,9 +32,10 @@ TEX_DIM_MS = {2: 6, 5: 7}
 # Unity ShaderParamType (Float, Int, Bool, Half, Short, UInt) -> SVT
 PARAM_TYPE = {0: SVT_FLOAT, 1: SVT_INT, 2: SVT_BOOL, 3: SVT_FLOAT, 4: SVT_INT, 5: SVT_UINT}
 
-# Binding kinds in 2020 blob parameter records
-# (2 = structured buffer, as seen on unity_ParticleInstanceData; 3 and 4 assumed)
-BIND_TEXTURE, BIND_CBUFFER, BIND_BUFFER, BIND_SAMPLER, BIND_UAV = 0, 1, 2, 3, 4
+# Binding kinds in blob parameter records (2 = structured buffer, as seen on
+# unity_ParticleInstanceData; 4 = inline sampler state, nameless, seen in 2021.2+;
+# 3 assumed)
+BIND_TEXTURE, BIND_CBUFFER, BIND_BUFFER, BIND_UAV, BIND_SAMPLER = 0, 1, 2, 3, 4
 
 
 @dataclass
@@ -129,6 +132,19 @@ def parse_blob_params(tail: bytes) -> tuple[int, list[tuple[int, int]], Reflecti
 
     Layout:
       u32 sourceMap; u32 n; n * (u32 source, u32 target)       vertex channels
+      parameters (see parse_params)
+    """
+    rd = _Reader(tail)
+    source_map = rd.u32()
+    channels = [(rd.u32(), rd.u32()) for _ in range(rd.u32())]
+    return source_map, channels, _read_params(rd)
+
+
+def parse_params(data: bytes) -> Reflection:
+    """Parse a parameter record: the rest of a 2020 tail, or a 2021.2+ parameter blob entry
+    after its version word.
+
+    Layout:
       u32 groups; groups * {
           string name; u32 usedSize; u32 n;
           n * {string name; u32 type, rows, cols, isMatrix, arraySize, offset}
@@ -136,9 +152,10 @@ def parse_blob_params(tail: bytes) -> tuple[int, list[tuple[int, int]], Reflecti
       u32 bindings; bindings * {
           string name; u32 kind, index, extra; [u32 dim<<1|ms if kind == texture] }
     """
-    rd = _Reader(tail)
-    source_map = rd.u32()
-    channels = [(rd.u32(), rd.u32()) for _ in range(rd.u32())]
+    return _read_params(_Reader(data))
+
+
+def _read_params(rd: _Reader) -> Reflection:
     r = Reflection()
     for _ in range(rd.u32()):
         name = rd.string()
@@ -163,10 +180,10 @@ def parse_blob_params(tail: bytes) -> tuple[int, list[tuple[int, int]], Reflecti
         elif kind == BIND_CBUFFER:
             r.cb_slots[name] = index
         elif kind == BIND_SAMPLER:
-            r.samplers.setdefault(index, name)
+            r.samplers.setdefault(index, name or f"inlineSampler{index}")
         elif kind in (BIND_BUFFER, BIND_UAV):
             r.buffers[name] = index
-    return source_map, channels, r
+    return r
 
 
 def _var_size(rows: int, cols: int, elements: int) -> int:
@@ -204,8 +221,40 @@ class _Writer:
         return bytes(buf)
 
 
-def build_rdef(refl: Reflection, version_token: int) -> bytes:
-    """Build an RDEF chunk body from normalized reflection data."""
+# Prefix of the filler variables build_rdef(pad_blocks=True) adds
+PAD_PREFIX = "unityport_pad"
+
+
+def _padded(vs: list) -> list:
+    """Fill the gaps between cbuffer variables (sorted by offset) with filler variables.
+
+    Unity's reflection lists only the variables a program uses. HLSLcc declares
+    uniform blocks from RDEF without gaps, so std140 would move every variable
+    after a gap; fillers keep each one at its D3D offset.
+    """
+    out = []
+    end = 0
+    for var in vs:
+        offset = var[1]
+        while end < offset:
+            if end % 16 or offset - end < 16:
+                out.append((f"{PAD_PREFIX}{end}", end, SVC_SCALAR, SVT_FLOAT, 1, 1, 0))
+                end += 4
+            else:
+                n = (offset - end) // 16
+                out.append((f"{PAD_PREFIX}{end}", end, SVC_VECTOR, SVT_FLOAT, 1, 4, n if n > 1 else 0))
+                end += 16 * n
+        out.append(var)
+        end = max(end, offset + _var_size(var[4], var[5], var[6]))
+    return out
+
+
+def build_rdef(refl: Reflection, version_token: int, pad_blocks: bool = False) -> bytes:
+    """Build an RDEF chunk body from normalized reflection data.
+
+    pad_blocks: fill gaps in named cbuffers (all but $Globals), which HLSLcc
+    turns into std140 uniform blocks when asked to.
+    """
     major = (version_token >> 4) & 0xF
     w = _Writer()
 
@@ -234,7 +283,7 @@ def build_rdef(refl: Reflection, version_token: int) -> bytes:
     vars_off = cbs_off + cb_desc_size * len(cbs)
 
     cb_vars = []
-    for _, cb in cbs:
+    for cb_name, cb in cbs:
         vs = []
         for name, v in cb.vars.items():
             if v.is_matrix:
@@ -244,7 +293,7 @@ def build_rdef(refl: Reflection, version_token: int) -> bytes:
             vs.append((name, v.offset, cls, PARAM_TYPE.get(v.param_type, SVT_FLOAT),
                        v.rows if v.is_matrix else 1, v.cols, v.elements))
         vs.sort(key=lambda x: x[1])
-        cb_vars.append(vs)
+        cb_vars.append(_padded(vs) if pad_blocks and not cb_name.startswith("$") else vs)
     types_off = vars_off + var_desc_size * sum(len(v) for v in cb_vars)
 
     # Header

@@ -3,12 +3,14 @@
 // Usage: hlslcc_tool [330] [--explicit-locations] < jobs
 //
 // Reads jobs from stdin, one per line, tab separated:
-//   <vertex.dxbc>\t<fragment.dxbc>\t<output.glsl>
+//   <vertex.dxbc>\t<fragment.dxbc>\t<output.glsl>[\tuniform-blocks]
 // and writes each vertex+fragment pair as one Unity GLCore program:
 //   #ifdef VERTEX ... #endif
 //   #ifdef FRAGMENT ... #endif
 // Both stages are translated with shared cross-dependency data so varyings
-// line up. Prints "OK <output>" or "ERR <output> <message>" per job.
+// line up. "uniform-blocks" declares named constant buffers as std140
+// uniform blocks ($Globals stays plain uniforms), as Unity 2021.2+ does for
+// SRP shaders. Prints "OK <output>" or "ERR <output> <message>" per job.
 
 #include <cstdio>
 #include <fstream>
@@ -95,7 +97,7 @@ int main(int argc, char **argv)
         std::string part;
         while (std::getline(ss, part, '\t'))
             parts.push_back(part);
-        if (parts.size() != 3)
+        if (parts.size() != 3 && !(parts.size() == 4 && parts[3] == "uniform-blocks"))
         {
             std::cout << "ERR ? bad job line" << std::endl;
             continue;
@@ -111,7 +113,8 @@ int main(int argc, char **argv)
 
         GLSLCrossDependencyData deps;
         std::string vsGlsl, fsGlsl, error;
-        if (!Translate(vs, deps, lang, flags, vsGlsl, error) || !Translate(fs, deps, lang, flags, fsGlsl, error))
+        unsigned int jobFlags = flags | (parts.size() == 4 ? HLSLCC_FLAG_UNIFORM_BUFFER_OBJECT : 0);
+        if (!Translate(vs, deps, lang, jobFlags, vsGlsl, error) || !Translate(fs, deps, lang, jobFlags, fsGlsl, error))
         {
             std::cout << "ERR " << out << " " << error << std::endl;
             continue;

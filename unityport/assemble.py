@@ -7,6 +7,8 @@ from pathlib import Path
 
 # Per-platform runtime pieces in <Game>_Data that come from the Linux player instead.
 PLATFORM_DIRS = {"Mono", "MonoBleedingEdge", "Plugins"}
+# "Compressed" builds pack the serialized files into one bundle.
+DATA_BUNDLE = "data.unity3d"
 DEFAULT_RESOURCES = Path("Resources") / "unity default resources"
 
 
@@ -22,11 +24,13 @@ def assemble(game_dir: Path, data_dir: Path, variation: Path, out_dir: Path, arc
     # Game data, minus the Windows runtime.
     def ignore(src, names):
         if Path(src) == data_dir:
-            return [n for n in names if n in PLATFORM_DIRS]
+            return [n for n in names if n in PLATFORM_DIRS or n == DATA_BUNDLE]
         return []
 
     shutil.copytree(data_dir, out_data, ignore=ignore)
-    _report_windows_plugins(data_dir)
+    if (data_dir / DATA_BUNDLE).is_file():
+        _unpack_bundle(data_dir / DATA_BUNDLE, out_data)
+    _report_windows_plugins(data_dir, arch)
 
     # Engine assemblies: Linux versions replace Windows ones. Assemblies that
     # only the game ships (Assembly-CSharp, UnityEngine.UI, mscorlib...) stay.
@@ -69,15 +73,33 @@ def assemble(game_dir: Path, data_dir: Path, variation: Path, out_dir: Path, arc
     return out_data
 
 
-def _report_windows_plugins(data_dir: Path) -> None:
+def _unpack_bundle(bundle: Path, out_data: Path) -> None:
+    """Extract data.unity3d into loose files, which the player loads when the
+    bundle is absent. The settings and shader passes then work on them as usual."""
+    import UnityPy
+
+    files = UnityPy.load(str(bundle)).file.files
+    print(f"Unpacking {bundle.name} ({len(files)} files)")
+    root = out_data.resolve()
+    for name, f in files.items():
+        dest = (out_data / name).resolve()
+        if root not in dest.parents:
+            raise RuntimeError(f"Bad path in {bundle.name}: {name}")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(f.reader.bytes if hasattr(f, "reader") else f.bytes)
+
+
+def _report_windows_plugins(data_dir: Path, arch: str) -> None:
     plugins = data_dir / "Plugins"
     if not plugins.is_dir():
         return
-    dlls = [p.relative_to(data_dir) for p in plugins.rglob("*.dll")]
+    dlls = sorted(plugins.rglob("*.dll"))
     if dlls:
+        # Mono maps DllImport("foo") to libfoo.so, keeping the Windows name, so
+        # e.g. steam_api64 needs libsteam_api64.so although Valve ships libsteam_api.so.
         print("Warning: native Windows plugins need Linux equivalents:")
         for d in dlls:
-            print(f"  {d}")
+            print(f"  {d.relative_to(data_dir)} -> Plugins/{arch}/lib{d.stem}.so")
 
 
 def _write_icon(game_dir: Path, data_dir: Path, out_data: Path) -> None:

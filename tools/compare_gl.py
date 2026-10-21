@@ -32,31 +32,40 @@ def gl_variants(path: Path) -> dict:
         tree = obj.read_typetree()
         if sh.PLATFORM_GLCORE not in (tree.get("platforms") or []):
             continue
-        entries, _ = sh.parse_blob(sh.platform_blob(tree, sh.PLATFORM_GLCORE))
+        raw, _ = sh.split_blob(sh.platform_segments(tree, sh.PLATFORM_GLCORE))
         name = tree["m_ParsedForm"]["m_Name"]
         variants = out.setdefault(name, {})
+        # 2021.2+ keyword names are per shader; before, per pass
+        shader_names = tree["m_ParsedForm"].get("m_KeywordNames")
         for pi, ps in enumerate(sh._passes(tree["m_ParsedForm"])):
-            names = {i: n for n, i in ps["m_NameIndices"]}
-            for sp in ps["progVertex"]["m_SubPrograms"]:
+            names = dict(enumerate(shader_names)) if shader_names else {i: n for n, i in ps["m_NameIndices"]}
+            for sub in sh.subprograms(ps["progVertex"]):
+                sp = sub.sp
                 if sp["m_GpuProgramType"] != sh.GLCORE32:
                     continue
                 kw = sp.get("m_KeywordIndices", []) + sp.get("m_GlobalKeywordIndices", []) + \
                     sp.get("m_LocalKeywordIndices", [])
-                key = (pi, tuple(sorted(names.get(i, f"#{i}") for i in kw)), sp["m_ShaderHardwareTier"])
-                variants[key] = entries[sp["m_BlobIndex"]]
+                key = (pi, tuple(sorted(names.get(i, f"#{i}") for i in kw)), sub.tier)
+                entry = sh.BlobEntry.parse(raw[sp["m_BlobIndex"]])
+                if sub.params is None:
+                    params = entry.tail
+                else:  # 2021.2+: source map from the program, the rest from the parameter entry
+                    params = entry.tail[:8] + raw[sub.params][4:]
+                variants[key] = (entry, params, sp.get("m_ShaderRequirements"))
     return out
 
 
-def describe_tail(tail: bytes) -> tuple:
-    """(sourceMap, {uniform: (group#, layout...)}, {texture: binding})."""
-    rd = rdef._Reader(tail)
+def describe_params(params: bytes) -> tuple:
+    """(sourceMap, {uniform: (group#, layout...)}, {texture: binding}, {group: size})."""
+    rd = rdef._Reader(params)
     source_map = rd.u32()
     for _ in range(rd.u32()):
         rd.u32(), rd.u32()
     uniforms = {}
+    sizes = {}
     for g in range(rd.u32()):
         group = f"{g}:{rd.string()}"
-        rd.u32()
+        sizes[group] = rd.u32()
         for _ in range(rd.u32()):
             name = rd.string()
             uniforms[name] = (group,) + tuple(rd.u32() for _ in range(6))
@@ -66,7 +75,7 @@ def describe_tail(tail: bytes) -> tuple:
         name = rd.string()
         kind, index, extra = rd.u32(), rd.u32(), rd.u32()
         textures[name] = (kind, index, extra, rd.u32() if kind == rdef.BIND_TEXTURE else None)
-    return source_map, uniforms, textures
+    return source_map, uniforms, textures, sizes
 
 
 def main():
@@ -96,9 +105,13 @@ def main():
                 if verbose:
                     print(f"  {name}: {len(extra)} extra variants", sorted(extra)[:3])
             for key in sorted(set(t) & set(o)):
-                te, oe = t[key], o[key]
-                tdesc, odesc = describe_tail(te.tail), describe_tail(oe.tail)
+                (te, tparams, treq), (oe, oparams, oreq) = t[key], o[key]
+                tdesc, odesc = describe_params(tparams), describe_params(oparams)
                 issues = []
+                if treq != oreq:
+                    issues.append(f"requirements {treq} vs {oreq}")
+                if tdesc[3] != odesc[3]:
+                    issues.append(f"group sizes {tdesc[3]} vs {odesc[3]}")
                 if tdesc[0] != odesc[0]:
                     issues.append(f"sourceMap {tdesc[0]} vs {odesc[0]}")
                 if {n: v[:6] for n, v in tdesc[1].items()} != {n: v[:6] for n, v in odesc[1].items()}:
@@ -117,7 +130,7 @@ def main():
                     problems[i.split(" ")[0]] += 1
                 if issues and verbose:
                     print(f"  {name} {key}: {', '.join(issues)}")
-                    if "uniform set" in issues:
+                    if "uniform set" in issues or "uniform offsets" in issues:
                         for n in sorted(set(tdesc[1]) | set(odesc[1])):
                             if tdesc[1].get(n) != odesc[1].get(n):
                                 print(f"      {n}: unity {tdesc[1].get(n)} ours {odesc[1].get(n)}")

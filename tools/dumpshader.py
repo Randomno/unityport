@@ -44,12 +44,20 @@ def main():
                 for prog in ("progVertex", "progFragment"):
                     if ps[prog].get("m_CommonParameters"):
                         print(f"   {prog} common: {json.dumps(ps[prog]['m_CommonParameters'])[:1000]}")
-                    for sp in ps[prog]["m_SubPrograms"]:
-                        print(f"   {prog}: {json.dumps(sp)[:1000]}")
+                    for sub in sh.subprograms(ps[prog]):
+                        params = "" if sub.params is None else f" tier {sub.tier} parameters {sub.params}"
+                        print(f"   {prog}: {json.dumps(sub.sp)[:1000]}{params}")
         for platform in tree.get("platforms") or []:
-            entries, record = sh.parse_blob(sh.platform_blob(tree, platform))
-            print(f"== platform {platform} blob: {len(entries)} entries, {record}-byte index records")
-            for i, e in enumerate(entries):
+            raw, record = sh.split_blob(sh.platform_segments(tree, platform))
+            print(f"== platform {platform} blob: {len(raw)} entries, {record}-byte index records")
+            programs = {sub.sp["m_BlobIndex"] for ps in sh._passes(tree["m_ParsedForm"])
+                        for prog in ("progVertex", "progFragment") for sub in sh.subprograms(ps[prog])
+                        if sub.params is not None}
+            for i, data in enumerate(raw):
+                if programs and i not in programs:  # 2021.2+ parameter entry
+                    print(f"-- entry {i}: parameters {data.hex(' ', 4)[:1200]}")
+                    continue
+                e = sh.BlobEntry.parse(data)
                 print(f"-- entry {i}: version {e.version} type {e.program_type} keywords {e.keywords} "
                       f"local {e.local_keywords} code {len(e.code)} bytes")
                 print(f"   parameter block: {e.tail.hex(' ', 4)[:1200]}")
