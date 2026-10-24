@@ -20,6 +20,8 @@ foreach(patch ${HLSLCC_PATCHES})
     endif()
 endforeach()
 set(HLSLCC_LIBRARY_SHARED OFF CACHE BOOL "" FORCE)
+# HLSLcc asks for CMake 2.8 compatibility, which CMake 4 refuses; older versions ignore this
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 add_subdirectory(${HLSLCC_DIR} hlslcc EXCLUDE_FROM_ALL)
 
 add_executable(hlslcc_tool hlslcc_tool.cpp)

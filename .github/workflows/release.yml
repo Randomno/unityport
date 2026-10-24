@@ -11,6 +11,8 @@ on:
 jobs:
   build:
     strategy:
+      # A failure on one system shouldn't cancel the other's build
+      fail-fast: false
       matrix:
         include:
           # The oldest supported runner, as the Linux executable needs a glibc at least as
@@ -25,7 +27,7 @@ jobs:
     env:
       PYTHON: ${{ matrix.python }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
 
@@ -49,7 +51,7 @@ jobs:
       # python.org's builds include tkinter
       - name: Install Python (Windows)
         if: runner.os == 'Windows'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -67,7 +69,7 @@ jobs:
           "$PYTHON" tools/bundle.py
           "dist/${{ matrix.file }}" --version
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: unityport-${{ runner.os }}
           path: dist/${{ matrix.file }}
@@ -80,7 +82,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           path: dist
           merge-multiple: true
