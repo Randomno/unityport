@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unityport"
-version = "0.1.0"
+version = "1.0"
 description = "Port Windows Unity (Mono) games to native Linux, translating D3D11 shaders to OpenGL"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,6 +12,7 @@ dependencies = [
     "UnityPy>=1.25,<2",
     "lz4>=4",
     "Pillow>=9",
+    "tkinterdnd2>=0.4",  # drag and drop in the window
 ]
 
 [project.scripts]

@@ -9,12 +9,14 @@ them; only the editor does. They are copied from an editor install given with
 once they have been read, about 600 MB into the 3 GB archive), and cached.
 """
 
+import os
 import shutil
+import sys
 import tarfile
 import urllib.request
 from pathlib import Path
 
-from .player import BASE, CACHE
+from . import config
 from .version import UnityVersion
 
 PROFILE = Path("MonoBleedingEdge") / "lib" / "mono" / "unityjit-linux"
@@ -39,10 +41,30 @@ def _from_editor(editor: Path) -> Path:
     raise SystemExit(f"No {PROFILE.as_posix()} in {editor}")
 
 
+def hub_editor(version: str) -> Path | None:
+    """Unity Hub's default install folder for an editor version, if it has the profile.
+    Editors for every OS ship it, so e.g. the Windows editor serves a port made on Windows."""
+    if os.name == "nt":
+        base = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Unity" / "Hub" / "Editor"
+    elif sys.platform == "darwin":
+        base = Path("/Applications/Unity/Hub/Editor")
+    else:
+        base = Path.home() / "Unity" / "Hub" / "Editor"
+    return base / version if has_profile(base / version) else None
+
+
+def has_profile(editor: Path) -> bool:
+    try:
+        _from_editor(editor)
+    except SystemExit:
+        return False
+    return True
+
+
 def _download(uv: UnityVersion, dest: Path) -> None:
     if not uv.revision:
         raise SystemExit(f"Unknown build revision for Unity {uv.version}; pass its editor with --editor")
-    url = BASE.format(rev=uv.revision) + EDITOR_ARCHIVE
+    url = config.download_base(uv.revision) + EDITOR_ARCHIVE
     print(f"Downloading the Linux class libraries from {url}\n"
           "  (streamed until they have been read, typically about 600 MB)")
     dest.mkdir(parents=True)
@@ -72,7 +94,7 @@ def _download(uv: UnityVersion, dest: Path) -> None:
 
 def linux_bcl(uv: UnityVersion, editor: Path | None = None) -> Path:
     """The unityjit-linux profile directory for a Unity version, cached on first use."""
-    cached = CACHE / uv.version / "unityjit-linux"
+    cached = config.CACHE / uv.version / "unityjit-linux"
     if (cached / "mscorlib.dll").is_file():
         return cached
     tmp = cached.with_name(cached.name + ".part")

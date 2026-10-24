@@ -1,0 +1,90 @@
+# Builds the standalone executables (tools/bundle.py) for Linux and Windows.
+# A pushed tag such as v0.2.0 publishes them as a release; running the workflow by hand
+# only builds them, as artifacts of the run. See docs/development.md.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          # The oldest supported runner, as the Linux executable needs a glibc at least as
+          # new as the build machine's (2.35 here)
+          - os: ubuntu-22.04
+            file: unityport
+            python: /usr/bin/python3
+          - os: windows-latest
+            file: unityport.exe
+            python: python
+    runs-on: ${{ matrix.os }}
+    env:
+      PYTHON: ${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Check the tag matches the version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          project=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)
+          package=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' unityport/__init__.py)
+          echo "tag $tag, pyproject.toml $project, __init__.py $package"
+          [ "$tag" = "$project" ] && [ "$tag" = "$package" ]
+
+      # The distro's Python and Tk, whose text is antialiased (see tools/bundle.py)
+      - name: Install Python and Tk (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk python3-venv
+
+      # python.org's builds include tkinter
+      - name: Install Python (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test
+        shell: bash
+        run: |
+          "$PYTHON" -m venv build/test-venv
+          if [ -x build/test-venv/bin/python ]; then py=build/test-venv/bin/python; else py=build/test-venv/Scripts/python.exe; fi
+          "$py" -m pip install -q -e .
+          "$py" -m unittest discover -v tests
+
+      - name: Build
+        shell: bash
+        run: |
+          "$PYTHON" tools/bundle.py
+          "dist/${{ matrix.file }}" --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unityport-${{ runner.os }}
+          path: dist/${{ matrix.file }}
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/unityport dist/unityport.exe --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes

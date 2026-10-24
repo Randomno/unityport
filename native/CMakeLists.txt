@@ -6,6 +6,19 @@ set(HLSLCC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/HLSLcc" CACHE PATH "HLSLcc source di
 if(NOT EXISTS "${HLSLCC_DIR}/CMakeLists.txt")
     message(FATAL_ERROR "HLSLcc not found in ${HLSLCC_DIR}; run: git submodule update --init")
 endif()
+# Fixes to HLSLcc kept as patches, applied to the submodule unless already applied
+find_package(Git REQUIRED)
+file(GLOB HLSLCC_PATCHES "${CMAKE_CURRENT_SOURCE_DIR}/patches/*.patch")
+foreach(patch ${HLSLCC_PATCHES})
+    execute_process(COMMAND ${GIT_EXECUTABLE} apply --reverse --check ${patch}
+                    WORKING_DIRECTORY ${HLSLCC_DIR} RESULT_VARIABLE applied OUTPUT_QUIET ERROR_QUIET)
+    if(NOT applied EQUAL 0)
+        execute_process(COMMAND ${GIT_EXECUTABLE} apply ${patch} WORKING_DIRECTORY ${HLSLCC_DIR} RESULT_VARIABLE failed)
+        if(failed)
+            message(FATAL_ERROR "Could not apply ${patch} to ${HLSLCC_DIR}")
+        endif()
+    endif()
+endforeach()
 set(HLSLCC_LIBRARY_SHARED OFF CACHE BOOL "" FORCE)
 add_subdirectory(${HLSLCC_DIR} hlslcc EXCLUDE_FROM_ALL)
 

@@ -1,9 +1,12 @@
 """Combine a Windows game's data with the Linux player into a new build folder."""
 
+import io
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+
+from . import bundled, version
 
 # Per-platform runtime pieces in <Game>_Data that come from the Linux player instead.
 PLATFORM_DIRS = {"Mono", "MonoBleedingEdge", "Plugins"}
@@ -14,11 +17,11 @@ DEFAULT_RESOURCES = Path("Resources") / "unity default resources"
 
 def assemble(game_dir: Path, data_dir: Path, variation: Path, out_dir: Path, arch: str) -> Path:
     """Build the Linux game in out_dir and return its <Game>_Data directory."""
-    name = data_dir.name[: -len("_Data")]
+    name = version.game_name(game_dir, data_dir)
     if out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True)
-    out_data = out_dir / data_dir.name
+    out_data = out_dir / f"{name}_Data"
     linux_data = variation / "Data"
 
     # Game data, minus the Windows runtime.
@@ -30,7 +33,6 @@ def assemble(game_dir: Path, data_dir: Path, variation: Path, out_dir: Path, arc
     shutil.copytree(data_dir, out_data, ignore=ignore)
     if (data_dir / DATA_BUNDLE).is_file():
         _unpack_bundle(data_dir / DATA_BUNDLE, out_data)
-    _report_windows_plugins(data_dir, arch)
 
     # Engine assemblies: Linux versions replace Windows ones. Assemblies that
     # only the game ships (Assembly-CSharp, UnityEngine.UI, mscorlib...) stay.
@@ -89,35 +91,23 @@ def _unpack_bundle(bundle: Path, out_data: Path) -> None:
         dest.write_bytes(f.reader.bytes if hasattr(f, "reader") else f.bytes)
 
 
-def _report_windows_plugins(data_dir: Path, arch: str) -> None:
-    plugins = data_dir / "Plugins"
-    if not plugins.is_dir():
-        return
-    dlls = sorted(plugins.rglob("*.dll"))
-    if dlls:
-        # Mono maps DllImport("foo") to libfoo.so, keeping the Windows name, so
-        # e.g. steam_api64 needs libsteam_api64.so although Valve ships libsteam_api.so.
-        print("Warning: native Windows plugins need Linux equivalents:")
-        for d in dlls:
-            print(f"  {d.relative_to(data_dir)} -> Plugins/{arch}/lib{d.stem}.so")
-
-
 def _write_icon(game_dir: Path, data_dir: Path, out_data: Path) -> None:
     """Linux players take their window icon from Resources/UnityPlayer.png;
     Windows builds embed it in the exe instead."""
     dest = out_data / "Resources" / "UnityPlayer.png"
-    exe = game_dir / (data_dir.name[: -len("_Data")] + ".exe")
+    exe = game_dir / (version.game_name(game_dir, data_dir) + ".exe")
     if dest.exists() or not exe.exists():
         return
     from PIL import Image  # installed with UnityPy
 
     with tempfile.TemporaryDirectory() as tmp:
-        subprocess.run(["7z", "x", "-y", f"-o{tmp}", str(exe), ".rsrc/ICON/*"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run([bundled.seven_zip(), "x", "-y", f"-o{tmp}", str(exe), ".rsrc/ICON/*"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **bundled.NO_WINDOW)
         best = None
         for ico in Path(tmp).glob(".rsrc/ICON/*"):
             try:
-                im = Image.open(ico)
+                # From memory: an open file would stop Windows deleting the folder
+                im = Image.open(io.BytesIO(ico.read_bytes()))
                 im.load()
             except Exception:
                 continue

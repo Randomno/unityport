@@ -50,7 +50,7 @@ def main():
         rgb = colorsys.hsv_to_rgb(k / len(targets), 1.0, 1.0 if k % 2 else 0.6)
         raw, record = sh.split_blob(sh.platform_segments(tree, sh.PLATFORM_GLCORE))
         programs = {sub.sp["m_BlobIndex"] for ps in sh._passes(tree["m_ParsedForm"])
-                    for sub in sh.subprograms(ps["progVertex"]) if sub.sp["m_GpuProgramType"] == sh.GLCORE32}
+                    for sub in sh.subprograms(ps["progVertex"]) if sub.sp["m_GpuProgramType"] in sh.GLCORE}
         entries = []
         for i, data in enumerate(raw):
             if i in programs:  # 2021.2+ blobs also hold parameter entries

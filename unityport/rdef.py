@@ -16,11 +16,12 @@ Where Unity keeps the reflection data depends on the version:
 Both are normalized into a Reflection before building RDEF.
 """
 
+import re
 import struct
 from dataclasses import dataclass, field
 
 # D3D_SHADER_INPUT_TYPE
-SIT_CBUFFER, SIT_TEXTURE, SIT_SAMPLER = 0, 2, 3
+SIT_CBUFFER, SIT_TEXTURE, SIT_SAMPLER, SIT_UAV_RWTYPED = 0, 2, 3, 4
 # D3D_SHADER_VARIABLE_CLASS / TYPE
 SVC_SCALAR, SVC_VECTOR, SVC_MATRIX_COLUMNS = 0, 1, 3
 SVT_BOOL, SVT_INT, SVT_FLOAT, SVT_UINT = 1, 2, 3, 19
@@ -29,6 +30,8 @@ RETURN_TYPE_FLOAT = 5
 # Unity TextureDimension -> D3D_SRV_DIMENSION
 TEX_DIM = {2: 4, 3: 8, 4: 9, 5: 5, 6: 10}
 TEX_DIM_MS = {2: 6, 5: 7}
+# Shader bytecode resource dimension -> D3D_SRV_DIMENSION
+SB_DIM = {1: 1, 2: 2, 3: 4, 4: 6, 5: 8, 6: 9, 7: 3, 8: 5, 9: 7, 10: 10}
 # Unity ShaderParamType (Float, Int, Bool, Half, Short, UInt) -> SVT
 PARAM_TYPE = {0: SVT_FLOAT, 1: SVT_INT, 2: SVT_BOOL, 3: SVT_FLOAT, 4: SVT_INT, 5: SVT_UINT}
 
@@ -69,6 +72,9 @@ class Reflection:
     textures: dict[str, Texture] = field(default_factory=dict)
     samplers: dict[int, str] = field(default_factory=dict)
     buffers: dict[str, int] = field(default_factory=dict)  # structured buffers / UAVs (unsupported)
+    # Typed UAVs the program declares but Unity doesn't reflect: a pixel shader's random
+    # write targets (Graphics.SetRandomWriteTarget), bound by slot. slot -> (dim, return type)
+    uavs: dict[int, tuple[int, int]] = field(default_factory=dict)
 
     def merge(self, other: "Reflection") -> "Reflection":
         out = Reflection()
@@ -81,6 +87,7 @@ class Reflection:
             out.textures.update(src.textures)
             out.samplers.update(src.samplers)
             out.buffers.update(src.buffers)
+            out.uavs.update(src.uavs)
         return out
 
 
@@ -225,24 +232,26 @@ class _Writer:
 PAD_PREFIX = "unityport_pad"
 
 
-def _padded(vs: list) -> list:
+def _padded(vs: list, block: str = "") -> list:
     """Fill the gaps between cbuffer variables (sorted by offset) with filler variables.
 
     Unity's reflection lists only the variables a program uses. HLSLcc declares
     uniform blocks from RDEF without gaps, so std140 would move every variable
-    after a gap; fillers keep each one at its D3D offset.
+    after a gap; fillers keep each one at its D3D offset. Members of unnamed blocks share
+    the global namespace, so fillers carry their block's name.
     """
+    prefix = PAD_PREFIX + (re.sub(r"\W", "_", block) + "_" if block else "")
     out = []
     end = 0
     for var in vs:
         offset = var[1]
         while end < offset:
             if end % 16 or offset - end < 16:
-                out.append((f"{PAD_PREFIX}{end}", end, SVC_SCALAR, SVT_FLOAT, 1, 1, 0))
+                out.append((f"{prefix}{end}", end, SVC_SCALAR, SVT_FLOAT, 1, 1, 0))
                 end += 4
             else:
                 n = (offset - end) // 16
-                out.append((f"{PAD_PREFIX}{end}", end, SVC_VECTOR, SVT_FLOAT, 1, 4, n if n > 1 else 0))
+                out.append((f"{prefix}{end}", end, SVC_VECTOR, SVT_FLOAT, 1, 4, n if n > 1 else 0))
                 end += 16 * n
         out.append(var)
         end = max(end, offset + _var_size(var[4], var[5], var[6]))
@@ -272,6 +281,9 @@ def build_rdef(refl: Reflection, version_token: int, pad_blocks: bool = False) -
             samplers.setdefault(tex.sampler, "sampler" + name)
     for point, name in sorted(samplers.items()):
         bindings.append((name, SIT_SAMPLER, 0, 0, 0, point))
+    for slot, (dim, ret) in sorted(refl.uavs.items()):
+        # Unity's own GLSL names it after the HLSL variable, which only the stripped RDEF had
+        bindings.append((f"unityport_uav{slot}", SIT_UAV_RWTYPED, ret, dim, 0xFFFFFFFF, slot))
 
     header_size = 28
     binding_size = 32
@@ -293,7 +305,7 @@ def build_rdef(refl: Reflection, version_token: int, pad_blocks: bool = False) -
             vs.append((name, v.offset, cls, PARAM_TYPE.get(v.param_type, SVT_FLOAT),
                        v.rows if v.is_matrix else 1, v.cols, v.elements))
         vs.sort(key=lambda x: x[1])
-        cb_vars.append(_padded(vs) if pad_blocks and not cb_name.startswith("$") else vs)
+        cb_vars.append(_padded(vs, cb_name) if pad_blocks and not cb_name.startswith("$") else vs)
     types_off = vars_off + var_desc_size * sum(len(v) for v in cb_vars)
 
     # Header
@@ -349,6 +361,26 @@ def version_token(dxbc: bytes) -> int:
         if fourcc in (b"SHDR", b"SHEX"):
             return struct.unpack_from("<I", data, 0)[0]
     raise ValueError("DXBC has no shader code chunk")
+
+
+OPCODE_CUSTOMDATA, OPCODE_DCL_UAV_TYPED = 0x35, 0x9C
+
+
+def typed_uavs(dxbc: bytes) -> dict[int, tuple[int, int]]:
+    """The typed UAVs (RWTexture*) a program declares: slot -> (D3D_SRV_DIMENSION, return type)."""
+    code = next(data for fourcc, data in _chunks(dxbc) if fourcc in (b"SHDR", b"SHEX"))
+    words = struct.unpack_from(f"<{len(code) // 4}I", code)
+    out = {}
+    i = 2  # after the version and length tokens
+    while i < len(words):
+        token = words[i]
+        opcode = token & 0x7FF
+        length = words[i + 1] if opcode == OPCODE_CUSTOMDATA else (token >> 24) & 0x7F
+        if opcode == OPCODE_DCL_UAV_TYPED:
+            # operand token, register index, return type token (4 bits per component)
+            out[words[i + 2]] = (SB_DIM.get((token >> 11) & 0x1F, 4), words[i + 3] & 0xF)
+        i += max(length, 1)
+    return out
 
 
 def with_rdef(dxbc: bytes, rdef: bytes) -> bytes:

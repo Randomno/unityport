@@ -6,10 +6,11 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import config
+
 # Matches e.g. 2017.3.0f3, 5.4.4p1, 2021.3.11f1
 VERSION_RE = rb"(\d{1,4}\.\d+\.\d+[abfpx]\d+)"
 
-RELEASES_API = "https://services.api.unity.com/unity/editor/release/v1/releases?version={}"
 
 
 @dataclass
@@ -22,16 +23,32 @@ class UnityVersion:
         return int(self.version.split(".")[0])
 
 
+def _game_exes(game_dir: Path) -> list[Path]:
+    return [e for e in sorted(game_dir.glob("*.exe")) if not e.stem.startswith("UnityCrashHandler")]
+
+
 def find_data_dir(game_dir: Path) -> Path:
-    """Return the <Game>_Data directory of a Windows build."""
-    for exe in sorted(game_dir.glob("*.exe")):
+    """Return the <Game>_Data directory of a Windows build, or a folder named Data, which
+    the player also accepts (and which survives renaming the exe)."""
+    for exe in _game_exes(game_dir):
         data = game_dir / (exe.stem + "_Data")
         if data.is_dir():
             return data
     candidates = [p for p in game_dir.glob("*_Data") if p.is_dir()]
     if len(candidates) == 1:
         return candidates[0]
+    data = game_dir / "Data"
+    if (data / "globalgamemanagers").is_file() or (data / "data.unity3d").is_file():
+        return data
     raise FileNotFoundError(f"No <Game>_Data directory found in {game_dir}")
+
+
+def game_name(game_dir: Path, data_dir: Path) -> str:
+    """The game's name, for the Linux executable and its <name>_Data folder."""
+    if data_dir.name.endswith("_Data"):
+        return data_dir.name[: -len("_Data")]
+    exes = _game_exes(game_dir)
+    return exes[0].stem if len(exes) == 1 else game_dir.name
 
 
 def _serialized_file_version(path: Path) -> str | None:
@@ -48,7 +65,7 @@ def _serialized_file_version(path: Path) -> str | None:
     return m.group(1).decode() if m else None
 
 
-def _version_from_data(data_dir: Path) -> str | None:
+def version_from_data(data_dir: Path) -> str | None:
     for name in ("globalgamemanagers", "mainData", "level0", "data.unity3d"):
         p = data_dir / name
         if p.is_file():
@@ -87,7 +104,7 @@ def _revision_from_binaries(game_dir: Path, version: str) -> str | None:
 
 def _revision_from_api(version: str) -> str | None:
     try:
-        with urllib.request.urlopen(RELEASES_API.format(version), timeout=30) as r:
+        with urllib.request.urlopen(config.releases_api(version), timeout=30) as r:
             data = json.load(r)
     except OSError:
         return None
@@ -105,7 +122,7 @@ def _revision_from_api(version: str) -> str | None:
 
 def detect(game_dir: Path) -> UnityVersion:
     data_dir = find_data_dir(game_dir)
-    version = _version_from_data(data_dir)
+    version = version_from_data(data_dir)
     if not version:
         raise RuntimeError(f"Could not determine Unity version from {data_dir}")
     revision = _revision_from_binaries(game_dir, version) or _revision_from_api(version)

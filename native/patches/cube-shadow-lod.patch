@@ -1,0 +1,24 @@
+diff --git a/src/toGLSLInstruction.cpp b/src/toGLSLInstruction.cpp
+index c0732ff..0a61177 100644
+--- a/src/toGLSLInstruction.cpp
++++ b/src/toGLSLInstruction.cpp
+@@ -1236,6 +1236,10 @@ void ToGLSL::TranslateTextureSample(Instruction* psInst,
+ 
+     // GLSL doesn't have textureLod() for 2d shadow samplers, we'll have to use grad instead. In that case assume LOD 0.
+     bool needsLodWorkaround = (eResDim == RESOURCE_DIMENSION_TEXTURE2DARRAY) && (ui32Flags & TEXSMP_FLAG_DEPTHCOMPARE);
++    // unityport: nor for cube shadow samplers (SampleCmpLevelZero on a TextureCube)
++    const bool cubeLodWorkaround = (eResDim == RESOURCE_DIMENSION_TEXTURECUBE) && (ui32Flags & TEXSMP_FLAG_DEPTHCOMPARE) &&
++        (ui32Flags & (TEXSMP_FLAG_LOD | TEXSMP_FLAG_FIRSTLOD));
++    needsLodWorkaround = needsLodWorkaround || cubeLodWorkaround;
+     const bool needsLodWorkaroundES2 = (psContext->psShader->eTargetLanguage == LANG_ES_100 && psContext->psShader->eShaderType == PIXEL_SHADER && (ui32Flags & TEXSMP_FLAG_DEPTHCOMPARE));
+ 
+     // Workaround for switch for OPCODE_SAMPLE_C_LZ, in particular sampler2dArrayShadow.SampleCmpLevelZero().
+@@ -1310,7 +1314,7 @@ void ToGLSL::TranslateTextureSample(Instruction* psInst,
+     // Add LOD/grad parameters based on the flags
+     if (needsLodWorkaround)
+     {
+-        bcatcstr(glsl, ", vec2(0.0, 0.0), vec2(0.0, 0.0)");
++        bcatcstr(glsl, cubeLodWorkaround ? ", vec3(0.0), vec3(0.0)" : ", vec2(0.0, 0.0), vec2(0.0, 0.0)");
+     }
+     else if (ui32Flags & TEXSMP_FLAG_LOD)
+     {

@@ -41,7 +41,7 @@ def gl_variants(path: Path) -> dict:
             names = dict(enumerate(shader_names)) if shader_names else {i: n for n, i in ps["m_NameIndices"]}
             for sub in sh.subprograms(ps["progVertex"]):
                 sp = sub.sp
-                if sp["m_GpuProgramType"] != sh.GLCORE32:
+                if sp["m_GpuProgramType"] not in sh.GLCORE:
                     continue
                 kw = sp.get("m_KeywordIndices", []) + sp.get("m_GlobalKeywordIndices", []) + \
                     sp.get("m_LocalKeywordIndices", [])

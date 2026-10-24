@@ -9,3 +9,8 @@ __pycache__/
 
 # Native build output
 /native/build*/
+
+# Bundle build (tools/bundle.py)
+/build/
+/dist/
+docs/logo.svg

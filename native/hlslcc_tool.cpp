@@ -92,12 +92,32 @@ int main(int argc, char **argv)
     std::string line;
     while (std::getline(std::cin, line))
     {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
         std::vector<std::string> parts;
         std::stringstream ss(line);
         std::string part;
         while (std::getline(ss, part, '\t'))
             parts.push_back(part);
-        if (parts.size() != 3 && !(parts.size() == 4 && parts[3] == "uniform-blocks"))
+        // Per-job options after the three paths: "uniform-blocks", and a GLSL version
+        // ("330", "410", "420") overriding the default
+        GLLang jobLang = lang;
+        unsigned int jobFlags = flags;
+        bool bad = parts.size() < 3;
+        for (size_t i = 3; i < parts.size(); i++)
+        {
+            if (parts[i] == "uniform-blocks")
+                jobFlags |= HLSLCC_FLAG_UNIFORM_BUFFER_OBJECT;
+            else if (parts[i] == "330")
+                jobLang = LANG_330;
+            else if (parts[i] == "410")
+                jobLang = LANG_410;
+            else if (parts[i] == "420")
+                jobLang = LANG_420;
+            else
+                bad = true;
+        }
+        if (bad)
         {
             std::cout << "ERR ? bad job line" << std::endl;
             continue;
@@ -113,8 +133,12 @@ int main(int argc, char **argv)
 
         GLSLCrossDependencyData deps;
         std::string vsGlsl, fsGlsl, error;
-        unsigned int jobFlags = flags | (parts.size() == 4 ? HLSLCC_FLAG_UNIFORM_BUFFER_OBJECT : 0);
-        if (!Translate(vs, deps, lang, jobFlags, vsGlsl, error) || !Translate(fs, deps, lang, jobFlags, fsGlsl, error))
+        // Fragment shader first, as HLSLcc expects: starting it clears deps, and the vertex
+        // shader then takes from it the interpolation of its outputs ("flat" for
+        // nointerpolation) and, from GLSL 4.1 on, their locations. Both must match the
+        // fragment inputs; D3D11 links the stages by semantic, so a vertex shader may write
+        // more or differently ordered outputs than the fragment shader reads.
+        if (!Translate(fs, deps, jobLang, jobFlags, fsGlsl, error) || !Translate(vs, deps, jobLang, jobFlags, vsGlsl, error))
         {
             std::cout << "ERR " << out << " " << error << std::endl;
             continue;

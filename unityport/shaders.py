@@ -35,6 +35,7 @@ std140 uniform blocks ($Globals stays plain uniforms); shaders using the
 built-in pipeline's UnityCG includes get plain uniforms throughout.
 """
 
+import copy
 import re
 import struct
 import subprocess
@@ -45,7 +46,7 @@ from pathlib import Path
 import lz4.block
 import UnityPy
 
-from . import rdef
+from . import bundled, rdef
 from .glsl import apply_fixups
 
 PLATFORM_D3D11 = 4
@@ -53,6 +54,9 @@ PLATFORM_GLCORE = 15
 
 # ShaderGpuProgramType
 GLCORE32 = 6
+# GpuProgramType of GLCore programs by GLSL version; 150 and 330 are both GLCore32
+GLCORE41, GLCORE43 = 7, 8
+GLCORE = {GLCORE32, GLCORE41, GLCORE43}
 DX11_VERTEX = {15, 16}       # SM40, SM50
 DX11_PIXEL = {17, 18}
 DX11_OTHER_STAGES = {19, 20, 21, 22}  # geometry, hull, domain
@@ -60,7 +64,7 @@ DX11_OTHER_STAGES = {19, 20, 21, 22}  # geometry, hull, domain
 # Blob entry versions with separate global and local keyword lists
 LOCAL_KEYWORDS_VERSIONS = range(201806140, 202012090)
 
-TOOL = Path(__file__).resolve().parent.parent / "native" / "build" / "hlslcc_tool"
+TOOL = bundled.hlslcc_tool()
 
 
 def _first(x):
@@ -416,18 +420,18 @@ class Translator:
     def __init__(self, workdir: Path, explicit_locations: bool):
         self.workdir = workdir
         self.explicit_locations = explicit_locations
-        self.jobs: list[tuple[Path, Path, Path, bool]] = []
-        self.cache: dict[tuple[bytes, bytes, bool], int] = {}
+        self.jobs: list[tuple[Path, Path, Path, bool, int]] = []
+        self.cache: dict[tuple[bytes, bytes, bool, int], int] = {}
 
-    def add(self, vs: bytes, ps: bytes, uniform_blocks: bool = False) -> int:
-        key = (vs, ps, uniform_blocks)
+    def add(self, vs: bytes, ps: bytes, uniform_blocks: bool = False, glsl_version: int = 150) -> int:
+        key = (vs, ps, uniform_blocks, glsl_version)
         if key in self.cache:
             return self.cache[key]
         n = len(self.jobs)
         paths = (self.workdir / f"{n}.vs", self.workdir / f"{n}.ps", self.workdir / f"{n}.glsl")
         paths[0].write_bytes(vs)
         paths[1].write_bytes(ps)
-        self.jobs.append((*paths, uniform_blocks))
+        self.jobs.append((*paths, uniform_blocks, glsl_version))
         self.cache[key] = n
         return n
 
@@ -438,9 +442,12 @@ class Translator:
         status: dict[str, str] = {}
         start = 0
         while start < len(self.jobs):
-            stdin = "".join("\t".join(map(str, (v, p, o))) + ("\tuniform-blocks" if ub else "") + "\n"
-                            for v, p, o, ub in self.jobs[start:])
-            out = subprocess.run(args, input=stdin, capture_output=True, text=True)
+            # Names relative to the work folder, so its path may contain anything
+            stdin = "".join("\t".join([v.name, p.name, o.name] + (["uniform-blocks"] if ub else []) +
+                                      ([str(ver)] if ver != 150 else [])) + "\n"
+                            for v, p, o, ub, ver in self.jobs[start:])
+            out = subprocess.run(args, input=stdin, capture_output=True, text=True, cwd=self.workdir,
+                                 **bundled.NO_WINDOW)
             for line in out.stdout.splitlines():
                 kind, path, *msg = line.split(" ", 2)
                 status[path] = " ".join(msg)
@@ -448,17 +455,17 @@ class Translator:
             if out.returncode == 0 or done >= len(self.jobs):
                 break
             # HLSLcc crashed on the job after the last one reported; skip it and resume.
-            status[str(self.jobs[done][2])] = "translator crashed"
+            status[self.jobs[done][2].name] = "translator crashed"
             start = done + 1
         results: dict[int, bytes | str] = {}
-        for i, (_, _, o, _) in enumerate(self.jobs):
-            if str(o) in status and o.exists() and not status[str(o)]:
+        for i, (_, _, o, *_) in enumerate(self.jobs):
+            if o.name in status and o.exists() and not status[o.name]:
                 try:
                     results[i] = apply_fixups(o.read_bytes())
                 except ValueError as e:
                     results[i] = str(e)
             else:
-                results[i] = status.get(str(o)) or "translator crashed"
+                results[i] = status.get(o.name) or "translator crashed"
         return results
 
 
@@ -527,7 +534,22 @@ def program_dxbc(entry: BlobEntry, refl: rdef.Reflection, pad_blocks: bool) -> b
     if refl.buffers:
         # Structured buffers/UAVs need SSBOs (GL 4.3); GLCore 3.2 has none.
         raise Unsupported("structured buffers: " + ", ".join(refl.buffers))
+    refl.uavs = rdef.typed_uavs(dxbc)
     return rdef.with_rdef(dxbc, rdef.build_rdef(refl, rdef.version_token(dxbc), pad_blocks))
+
+
+def gl_target(requirements: int) -> tuple[int, int]:
+    """GLSL version and GpuProgramType Unity's GLCore compiler uses for a program with these
+    ShaderRequirements (which are the same as the D3D11 program's). Observed in official
+    2020.3 and 2022.3 Linux builds; D3D11 bytecode needs them too, e.g. bitfieldInsert in
+    URP's full-screen triangle is GLSL 4.0."""
+    if requirements & 0x4000:
+        return 420, GLCORE43
+    if requirements & 0x1000:
+        return 410, GLCORE41
+    if requirements & 0x800:
+        return 330, GLCORE32
+    return 150, GLCORE32
 
 
 def _passes(parsed: dict):
@@ -540,10 +562,10 @@ def _empty_params(params: dict) -> dict:
     return {k: [] if isinstance(v, list) else v for k, v in params.items()}
 
 
-def _gl_subprogram(template: dict, blob_index: int, source_map: int) -> dict:
+def _gl_subprogram(template: dict, blob_index: int, source_map: int, program_type: int = GLCORE32) -> dict:
     sp = dict(template)
     sp["m_BlobIndex"] = blob_index
-    sp["m_GpuProgramType"] = GLCORE32
+    sp["m_GpuProgramType"] = program_type
     sp["m_Channels"] = {"m_Channels": [], "m_SourceMap": source_map}
     if "m_Parameters" in sp:
         sp["m_Parameters"] = _empty_params(sp["m_Parameters"])
@@ -593,6 +615,7 @@ class Job:
     frag: Sub
     index: int  # translator job
     block_sizes: dict[str, int]  # D3D11 size of each named cbuffer either stage binds
+    program_type: int
 
 
 @dataclass
@@ -604,6 +627,30 @@ class ShaderPlan:
     layout: str
     jobs: list[Job] = field(default_factory=list)
     skipped: set = field(default_factory=set)
+
+
+def _share_blocks(vrefl: rdef.Reflection, frefl: rdef.Reflection) -> tuple:
+    """Give both stages every variable either uses in the uniform blocks they share.
+
+    The reflection lists only the variables a stage uses, so the two stages would
+    declare different members for e.g. UnityPerDraw, and GLSL rejects the program
+    ("definitions of uniform block do not match"). Returns the new reflections and a
+    key naming the shared members, for caching.
+    """
+    shared = sorted(n for n in vrefl.cb_slots.keys() & frefl.cb_slots.keys()
+                    if not n.startswith("$") and n in vrefl.cbuffers and n in frefl.cbuffers)
+    if not shared:
+        return vrefl, frefl, ()
+    out = []
+    for refl in (vrefl, frefl):
+        refl = copy.copy(refl)
+        refl.cbuffers = dict(refl.cbuffers)
+        for n in shared:
+            a, b = vrefl.cbuffers[n], frefl.cbuffers[n]
+            refl.cbuffers[n] = rdef.CBuffer(max(a.size, b.size), {**a.vars, **b.vars})
+        out.append(refl)
+    key = tuple((n, tuple(sorted(out[0].cbuffers[n].vars))) for n in shared)
+    return out[0], out[1], key
 
 
 def plan_shader(tree: dict, translator: Translator) -> ShaderPlan | None:
@@ -629,17 +676,22 @@ def plan_shader(tree: dict, translator: Translator) -> ShaderPlan | None:
         # variant set of Unity's own GLCore builds exactly.
         vert_kws = frozenset().union(*(_keywords(s.sp) for s in verts))
         frag_kws = frozenset().union(*(_keywords(s.sp) for s in frags))
-        cache: dict[tuple, tuple[bytes, dict] | Unsupported] = {}
+        refls: dict[tuple, rdef.Reflection] = {}
+        cache: dict[tuple, bytes | Unsupported] = {}
 
-        def dxbc_for(sub: Sub, prog: str) -> tuple[bytes, dict]:
+        def refl_for(sub: Sub, prog: str) -> rdef.Reflection:
             key = (prog, sub.sp["m_BlobIndex"], sub.params)
-            if key not in cache:
+            if key not in refls:
                 entry = plan.entries[sub.sp["m_BlobIndex"]]
                 params = None if sub.params is None else d3d[sub.params]
-                refl = _reflection(entry, sub.sp, ps[prog], names, params)
-                sizes = {n: cb.size for n, cb in refl.cbuffers.items() if n in refl.cb_slots}
+                refls[key] = _reflection(entry, sub.sp, ps[prog], names, params)
+            return refls[key]
+
+        def dxbc_for(sub: Sub, prog: str, refl: rdef.Reflection, blocks: tuple) -> bytes:
+            key = (prog, sub.sp["m_BlobIndex"], sub.params, blocks)
+            if key not in cache:
                 try:
-                    cache[key] = (program_dxbc(entry, refl, uniform_blocks), sizes)
+                    cache[key] = program_dxbc(plan.entries[sub.sp["m_BlobIndex"]], refl, uniform_blocks)
                 except Unsupported as e:
                     cache[key] = e
             if isinstance(cache[key], Unsupported):
@@ -652,12 +704,21 @@ def plan_shader(tree: dict, translator: Translator) -> ShaderPlan | None:
                 fk = _keywords(f.sp)
                 if f.tier != v.tier or vk & frag_kws != fk & vert_kws:
                     continue
+                vrefl, frefl = refl_for(v, "progVertex"), refl_for(f, "progFragment")
+                blocks: tuple = ()
+                if uniform_blocks:
+                    vrefl, frefl, blocks = _share_blocks(vrefl, frefl)
                 try:
-                    (vs, vsizes), (fs, fsizes) = dxbc_for(v, "progVertex"), dxbc_for(f, "progFragment")
+                    vs, fs = dxbc_for(v, "progVertex", vrefl, blocks), dxbc_for(f, "progFragment", frefl, blocks)
                 except Unsupported as e:
                     plan.skipped.add(str(e))
                     continue
-                plan.jobs.append(Job(ps, v, f, translator.add(vs, fs, uniform_blocks), {**vsizes, **fsizes}))
+                vsizes, fsizes = ({n: cb.size for n, cb in r.cbuffers.items() if n in r.cb_slots}
+                                  for r in (vrefl, frefl))
+                version, program_type = gl_target(v.sp.get("m_ShaderRequirements", 0) |
+                                                  f.sp.get("m_ShaderRequirements", 0))
+                plan.jobs.append(Job(ps, v, f, translator.add(vs, fs, uniform_blocks, version),
+                                     {**vsizes, **fsizes}, program_type))
     return plan if plan.jobs else None
 
 
@@ -700,12 +761,12 @@ def apply_plan(plan: ShaderPlan, results: dict) -> tuple[int, int, set[str]]:
                 entries.append(params)
             param_index = param_entries[params]
         vi = len(entries)
-        entries.append(BlobEntry(vsrc.version, GLCORE32, b"\0" * 16, keywords, local, glsl, tail))
+        entries.append(BlobEntry(vsrc.version, job.program_type, b"\0" * 16, keywords, local, glsl, tail))
         if plan.layout == LAYOUT_2021:
-            sp = dict(combined, m_BlobIndex=vi, m_GpuProgramType=GLCORE32,
+            sp = dict(combined, m_BlobIndex=vi, m_GpuProgramType=job.program_type,
                       m_ShaderRequirements=v["m_ShaderRequirements"] | f["m_ShaderRequirements"])
         else:
-            sp = _gl_subprogram(combined, vi, source_map)
+            sp = _gl_subprogram(combined, vi, source_map, job.program_type)
         new_subprograms.append((ps["progVertex"], job.vert.tier, sp, param_index))
         if plan.layout == LEGACY:
             fi = len(entries)
@@ -753,7 +814,7 @@ def _drop_d3d11(tree: dict) -> None:
             if not key.startswith("prog") or not isinstance(prog, dict):
                 continue
             if "m_PlayerSubPrograms" in prog:
-                tiers = [[(sp, p) for sp, p in zip(sps, params) if sp["m_GpuProgramType"] == GLCORE32]
+                tiers = [[(sp, p) for sp, p in zip(sps, params) if sp["m_GpuProgramType"] in GLCORE]
                          for sps, params in zip(prog["m_PlayerSubPrograms"], prog["m_ParameterBlobIndices"])]
                 if not any(tiers):
                     tiers = []
@@ -761,7 +822,7 @@ def _drop_d3d11(tree: dict) -> None:
                 prog["m_ParameterBlobIndices"] = [[p for _, p in t] for t in tiers]
             else:
                 prog["m_SubPrograms"] = [sp for sp in prog["m_SubPrograms"]
-                                         if sp["m_GpuProgramType"] == GLCORE32]
+                                         if sp["m_GpuProgramType"] in GLCORE]
             if "m_CommonParameters" in prog:
                 prog["m_CommonParameters"] = _empty_params(prog["m_CommonParameters"])
         platforms = ps.get("m_Platforms")
@@ -776,6 +837,22 @@ def _drop_d3d11(tree: dict) -> None:
     set_platforms(tree, [(p, None) for p in tree["platforms"] if p != PLATFORM_D3D11])
 
 
+def relabel_empty(tree: dict) -> bool:
+    """Mark a D3D11-only shader with no passes (Unity strips unused ones, e.g. URP's
+    StencilDeferred in a forward renderer, down to nothing) as GLCore. Left as D3D11, the
+    player logs "Desired shader compiler platform 15 is not available" and "All subshaders
+    removed" for it, which official Linux builds don't."""
+    platforms = tree.get("platforms") or []
+    if PLATFORM_GLCORE in platforms or PLATFORM_D3D11 not in platforms or any(_passes(tree["m_ParsedForm"])):
+        return False
+    if split_blob(platform_segments(tree, PLATFORM_D3D11))[0]:
+        # Entries no pass refers to (seen on Unity 6's DBufferClear): an empty blob will do
+        set_platforms(tree, [(p, build_segments([], 8) if p == PLATFORM_D3D11 else None) for p in platforms])
+        platforms = tree["platforms"]
+    platforms[platforms.index(PLATFORM_D3D11)] = PLATFORM_GLCORE
+    return True
+
+
 def convert_file(path: Path) -> tuple[int, int, int]:
     """Translate every D3D11-only shader in an assets file in place.
 
@@ -787,6 +864,7 @@ def convert_file(path: Path) -> tuple[int, int, int]:
         return 0, 0, 0
     layouts = {shader_layout(t) for _, t in shaders}
     plans = []
+    relabelled = 0
     with tempfile.TemporaryDirectory() as tmp:
         translator = Translator(Path(tmp), explicit_locations=layouts != {LEGACY})
         for obj, tree in shaders:
@@ -800,11 +878,12 @@ def convert_file(path: Path) -> tuple[int, int, int]:
                 plans.append((obj, plan))
                 for reason in plan.skipped:
                     print(f"  {name}: some variants skipped ({reason})")
-        if not plans:
-            return 0, 0, 0
-        results = translator.run()
+            elif relabel_empty(tree):
+                obj.save_typetree(tree)
+                relabelled += 1
+        results = translator.run() if plans else {}
 
-    changed = total_ok = total_failed = 0
+    changed, total_ok, total_failed = relabelled, 0, 0
     for obj, plan in plans:
         ok, failed, errors = apply_plan(plan, results)
         total_ok += ok

@@ -7,16 +7,14 @@ full Linux editor tarball.
 """
 
 import configparser
-import os
 import shutil
 import subprocess
 import urllib.request
 from pathlib import Path
 
+from . import bundled, config
 from .version import UnityVersion
 
-BASE = "https://download.unity3d.com/download_unity/{rev}/"
-CACHE = Path(os.environ.get("UNITYPORT_CACHE", Path.home() / ".cache" / "unityport"))
 
 
 def _download(url: str, dest: Path) -> None:
@@ -34,7 +32,7 @@ def _linux_installer_urls(uv: UnityVersion) -> list[str]:
     version tried. The Windows NSIS .exe also works for older versions, but
     from around 2020 its header flags are not understood by 7z.
     """
-    base = BASE.format(rev=uv.revision)
+    base = config.download_base(uv.revision)
     urls = []
     for platform in ("osx", "win"):
         try:
@@ -54,20 +52,27 @@ def _linux_installer_urls(uv: UnityVersion) -> list[str]:
     return list(dict.fromkeys(urls))
 
 
-def _extract_nested(archive: Path, dest: Path, depth: int = 3) -> None:
-    """7z-extract an archive, then keep unpacking while the result is a lone archive."""
-    subprocess.run(["7z", "x", "-y", f"-o{dest}", str(archive)], check=True,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def _extract_nested(archive: Path, dest: Path, depth: int = 4) -> None:
+    """7z-extract an archive, then keep unpacking while the result is a lone archive.
+
+    7-Zip 24 opens a .pkg as a xar archive, giving PackageInfo, Payload etc.;
+    older versions go straight to the payload. Either way the payload is followed.
+    """
+    r = subprocess.run([bundled.seven_zip(), "x", "-y", f"-o{dest}", str(archive)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **bundled.NO_WINDOW)
+    if r.returncode > 1:  # 1 is a non-fatal warning
+        raise subprocess.CalledProcessError(r.returncode, r.args)
     files = [p for p in dest.rglob("*") if p.is_file()]
-    if depth and len(files) == 1 and not any(dest.glob("**/Variations")):
-        inner = files[0]
+    payloads = [p for p in files if p.name == "Payload"]
+    if depth and (len(files) == 1 or len(payloads) == 1) and not any(dest.glob("**/Variations")):
+        inner = files[0] if len(files) == 1 else payloads[0]
         _extract_nested(inner, dest / "inner", depth - 1)
         inner.unlink()
 
 
 def variations_dir(uv: UnityVersion) -> Path:
     """Return the extracted LinuxStandaloneSupport/Variations directory."""
-    root = CACHE / uv.version
+    root = config.CACHE / uv.version
     extract = root / "extract"
     found = list(extract.glob("**/Variations")) if extract.exists() else []
     if found:
@@ -113,4 +118,6 @@ def pick_variation(variations: Path, arch: str) -> Path:
         if (name.startswith(f"linux{bits}_") and "nondevelopment" in name and name.endswith("_mono")
                 and "headless" not in name and "server" not in name):
             return variations / name
+    if bits == "32" and not any(n.startswith("linux32_") for n in names):
+        raise SystemExit("This Unity version has no 32-bit Linux player; use the 64-bit one (x86_64)")
     raise RuntimeError(f"No linux{bits} Mono player in {variations}: {names}")
